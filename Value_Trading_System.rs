@@ -1,21 +1,29 @@
-// --- Imports and Dependencies ---
-use serde::{Serialize, Deserialize}; // serde: Framework for serialization/deserialization of data structures to/from formats like JSON
-use std::collections::HashMap; // std::collections: Core data structures like HashMap for flexible data storage
-use chrono::{DateTime, Utc}; // chrono: Library for date/time handling, working with timestamps and UTC time
-use log::{info, warn, error}; // log: Macros for application diagnostics and monitoring
+// Imports and Dependencies
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use chrono::{DateTime, Utc, Local};
+use log::{info, warn, error};
+use polars::prelude::*;
+use std::error::Error;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use thiserror::Error;
+use env_logger;
+use tokio;
 
-#[derive(Debug, Serialize, Deserialize, Default)] // MarketData struct holds all market and fundamental data for a security; Derives Debug for printing, Serialize/Deserialize for data persistence
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MarketData {
     pub symbol: String,
-    pub price: f64, // Price and volume metrics
+    pub price: f64,
     pub volume: f64,
-    pub free_cash_flow: f64, // Fundamental metrics
+    pub free_cash_flow: f64,
     pub current_ratio: f64,
     pub quick_ratio: f64,
     pub gross_margin: f64,
     pub operating_margin: f64,
     pub net_profit_margin: f64,
-    pub beta: f64, // Market metrics
+    pub beta: f64,
     pub shares_outstanding: u64,
     pub operating_cash_flow: f64,
     pub book_to_market_ratio: f64,
@@ -26,25 +34,27 @@ pub struct MarketData {
     pub market_cap: f64,
     pub price_to_book: f64,
     pub revenue_per_share: f64,
-    pub fundamental_data: HashMap<String, f64>, // Additional data; Flexible storage for other metrics
+    pub fundamental_data: HashMap<String, f64>,
     pub revenue_growth: f64,
     pub timestamp: String,
     pub pe_ratio: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)] // TradeSignal represents a trading decision/recommendation
+// TradeSignal
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TradeSignal {
     pub asset: String,
-    pub action: String, // buy/sell/hold
+    pub action: String,
     pub quantity: f64,
     pub price: f64,
     pub reason: String,
     pub timestamp: DateTime<Utc>,
     pub risk_metrics: RiskMetrics,
-    pub analysis: HashMap<String, f64>, // Stores metrics used in decision
+    pub analysis: HashMap<String, f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)] // RiskMetrics tracks various risk measures
+// RiskMetrics
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RiskMetrics {
     pub volatility: f64,
     pub max_drawdown: f64,
@@ -53,7 +63,8 @@ pub struct RiskMetrics {
     pub portfolio_drawdown: f64,
 }
 
-#[derive(Debug)] // PortfolioMetrics tracks overall portfolio status and health
+// PortfolioMetrics
+#[derive(Debug)]
 pub struct PortfolioMetrics {
     pub total_value: f64,
     pub cash_balance: f64,
@@ -64,7 +75,8 @@ pub struct PortfolioMetrics {
     pub peak_equity: f64,
 }
 
-#[derive(Debug)] // Position tracks details of an individual holding
+// Position struct
+#[derive(Debug)]
 pub struct Position {
     pub quantity: f64,
     pub avg_price: f64,
@@ -77,7 +89,8 @@ pub struct Position {
     pub last_rebalance: DateTime<Utc>,
 }
 
-macro_rules! extract_field { // Helper macro for safely extracting data from DataFrames
+// Helper Macros
+macro_rules! extract_field {
     ($df:expr, $col:expr, $idx:expr, $field:expr) => {
         match $df.column($col)?.get($idx) {
             Some(AnyValue::Float64(val)) => Ok(val),
@@ -90,13 +103,8 @@ macro_rules! extract_field { // Helper macro for safely extracting data from Dat
     };
 }
 
-// --- Imports and Dependencies ---
-use crate::model::{MarketData, TradeSignal, RiskMetrics}; // crate::model: Custom module for market data, trade signals, and risk metrics
-use polars::prelude::*; // polars: DataFrame library for data manipulation and analysis
-use std::error::Error; // std::error: For error handling and propagation
-use thiserror::Error; // thiserror: For defining custom error types with automatic Display and Debug implementations
-
-#[derive(Error, Debug)] // Custom error types for trading operations
+// Error Handling
+#[derive(Error, Debug)]
 pub enum TradingError {
     #[error("Invalid market data: {0}")]
     InvalidMarketData(String),
@@ -106,8 +114,9 @@ pub enum TradingError {
     RiskLimitExceeded(String),
 }
 
-pub struct StrategyConfig { // Configuration parameters for strategy
-    pub pe_ratio_threshold: f64, // Various thresholds for fundamental metrics
+// Strategy Configuration
+pub struct StrategyConfig {
+    pub pe_ratio_threshold: f64,
     pub price_to_book_threshold: f64,
     pub free_cash_flow_threshold: f64,
     pub current_ratio_threshold: f64,
@@ -116,37 +125,39 @@ pub struct StrategyConfig { // Configuration parameters for strategy
     pub operating_margin_threshold: f64,
     pub net_profit_margin_threshold: f64,
     pub debt_to_equity_threshold: f64,
-    pub max_position_size: f64, // Risk management parameters
+    pub max_position_size: f64,
     pub volatility_threshold: f64,
     pub max_drawdown_limit: f64,
     pub rolling_window_size: usize,
     pub position_drift_threshold: f64,
 }
 
-pub trait Strategy { // Strategy trait defines interface for trading strategies
+// Strategy Trait
+pub trait Strategy {
     fn generate_signal(&mut self, data: &MarketData) -> Result<TradeSignal, TradingError>;
 }
 
-pub struct MarketDataStrategy { // Concrete implementation of market data based strategy
+// Market Data Strategy Implementation
+pub struct MarketDataStrategy {
     config: StrategyConfig,
     rolling_max_price: f64,
     returns: Vec<f64>,
-    prices: Vec<f64>, // New buffer for prices
+    prices: Vec<f64>,
     peak_portfolio_value: f64,
 }
 
 impl MarketDataStrategy {
     pub fn new(config: StrategyConfig) -> Self {
-        Self { 
+        Self {
             config,
             rolling_max_price: 0.0,
             returns: Vec::with_capacity(config.rolling_window_size),
-            prices: Vec::with_capacity(config.rolling_window_size), // Initialize price buffer
+            prices: Vec::with_capacity(config.rolling_window_size),
             peak_portfolio_value: 0.0
         }
     }
 
-    fn check_value_metrics(&self, data: &MarketData) -> Result<bool, TradingError> { // Check value investing metrics
+    fn check_value_metrics(&self, data: &MarketData) -> Result<bool, TradingError> {
         if data.pe_ratio <= 0.0 || data.price_to_book <= 0.0 {
             return Err(TradingError::InvalidMarketData("Invalid value metrics".into()));
         }
@@ -154,32 +165,32 @@ impl MarketDataStrategy {
             && data.price_to_book < self.config.price_to_book_threshold)
     }
 
-    fn check_financial_health(&self, data: &MarketData) -> Result<bool, TradingError> { // Check company financial health metrics
+    fn check_financial_health(&self, data: &MarketData) -> Result<bool, TradingError> {
         if data.free_cash_flow <= 0.0 || data.current_ratio <= 0.0 || data.quick_ratio <= 0.0 {
             return Err(TradingError::InvalidMarketData("Invalid financial health metrics".into()));
         }
         Ok(data.free_cash_flow > self.config.free_cash_flow_threshold
             && data.current_ratio > self.config.current_ratio_threshold
             && data.quick_ratio > self.config.quick_ratio_threshold
-            && data.gross_margin > self.config.gross_margin_threshold // New check for gross margin
-            && data.dividend_yield > 0.0) // New check for dividend yield
+            && data.gross_margin > self.config.gross_margin_threshold
+            && data.dividend_yield > 0.0)
     }
 
-    fn calculate_risk_metrics(&mut self, data: &MarketData, portfolio_value: f64) -> RiskMetrics { // Calculate various risk metrics
-        self.peak_portfolio_value = self.peak_portfolio_value.max(portfolio_value); // Track portfolio high watermark
+    fn calculate_risk_metrics(&mut self, data: &MarketData, portfolio_value: f64) -> RiskMetrics {
+        self.peak_portfolio_value = self.peak_portfolio_value.max(portfolio_value);
         
-        let portfolio_drawdown = if portfolio_value < self.peak_portfolio_value { // Calculate drawdown from peak
+        let portfolio_drawdown = if portfolio_value < self.peak_portfolio_value {
             (self.peak_portfolio_value - portfolio_value) / self.peak_portfolio_value
         } else {
             0.0
         };
 
-        if self.prices.len() >= self.config.rolling_window_size { // Maintain rolling window of prices
+        if self.prices.len() >= self.config.rolling_window_size {
             self.prices.remove(0);
         }
         self.prices.push(data.price);
 
-        if self.prices.len() > 1 { // Calculate return percentage from price buffer
+        if self.prices.len() > 1 {
             let last_price = self.prices[self.prices.len() - 2];
             let return_pct = (data.price - last_price) / last_price;
             self.returns.push(return_pct);
@@ -187,20 +198,20 @@ impl MarketDataStrategy {
             self.returns.push(0.0);
         }
 
-        let avg_return = self.returns.iter().sum::<f64>() / self.returns.len() as f64; // Calculate volatility
+        let avg_return = self.returns.iter().sum::<f64>() / self.returns.len() as f64;
         let return_variance = self.returns.iter()
             .map(|r| (r - avg_return).powi(2))
             .sum::<f64>() / self.returns.len() as f64;
         let volatility = return_variance.sqrt();
         
-        self.rolling_max_price = self.rolling_max_price.max(data.price); // Track price drawdown
+        self.rolling_max_price = self.rolling_max_price.max(data.price);
         let max_drawdown = if data.price < self.rolling_max_price {
             (self.rolling_max_price - data.price) / self.rolling_max_price
         } else {
             0.0
         };
 
-        let risk_free_rate = 0.02; // Calculate Sharpe ratio
+        let risk_free_rate = 0.02;
         let excess_return = avg_return - risk_free_rate;
         
         let sharpe_ratio = if self.returns.len() > 1 && return_variance > 0.0 {
@@ -218,10 +229,10 @@ impl MarketDataStrategy {
         }
     }
 
-    fn calculate_trade_quantity(&self, data: &MarketData, risk_metrics: &mut RiskMetrics) -> f64 { // Calculate position size based on risk factors
+    fn calculate_trade_quantity(&self, data: &MarketData, risk_metrics: &mut RiskMetrics) -> f64 {
         let base_position = 10000.0;
         
-        let vol_factor = (1.0 - risk_metrics.volatility).max(0.2); // Adjust position size based on multiple factors
+        let vol_factor = (1.0 - risk_metrics.volatility).max(0.2);
         let size_factor = (data.market_cap / 1_000_000_000.0).min(2.0).max(0.5);
         let risk_factor = if data.beta > self.config.volatility_threshold { 0.5 } else { 1.0 };
         let margin_factor = if data.operating_margin > self.config.operating_margin_threshold { 1.2 } else { 1.0 };
@@ -233,17 +244,17 @@ impl MarketDataStrategy {
     }
 }
 
-impl Strategy for MarketDataStrategy { // Strategy trait implementation
+impl Strategy for MarketDataStrategy {
     fn generate_signal(&mut self, data: &MarketData) -> Result<TradeSignal, TradingError> {
-        let mut risk_metrics = self.calculate_risk_metrics(data, self.peak_portfolio_value); // Use updated portfolio value
+        let mut risk_metrics = self.calculate_risk_metrics(data, self.peak_portfolio_value);
         let mut analysis = HashMap::new();
         
-        analysis.insert("volatility".to_string(), risk_metrics.volatility); // Store metrics for analysis
+        analysis.insert("volatility".to_string(), risk_metrics.volatility);
         analysis.insert("max_drawdown".to_string(), risk_metrics.max_drawdown);
         analysis.insert("pe_ratio".to_string(), data.pe_ratio);
         analysis.insert("price_to_book".to_string(), data.price_to_book);
         
-        if risk_metrics.max_drawdown > self.config.max_drawdown_limit { // Check risk limits
+        if risk_metrics.max_drawdown > self.config.max_drawdown_limit {
             return Err(TradingError::RiskLimitExceeded(
                 format!("Max drawdown {} exceeds limit {}", 
                     risk_metrics.max_drawdown, self.config.max_drawdown_limit)
@@ -253,7 +264,7 @@ impl Strategy for MarketDataStrategy { // Strategy trait implementation
         let quantity = self.calculate_trade_quantity(data, &mut risk_metrics);
         let timestamp = Utc::now();
 
-        let signal = if self.check_value_metrics(data)? && self.check_financial_health(data)? { // Generate appropriate signal based on metrics
+        let signal = if self.check_value_metrics(data)? && self.check_financial_health(data)? {
             TradeSignal {
                 action: "buy".to_string(),
                 quantity,
@@ -293,13 +304,8 @@ impl Strategy for MarketDataStrategy { // Strategy trait implementation
     }
 }
 
-// --- Imports and Dependencies ---
-use crate::model::{TradeSignal, MarketData}; // crate::model: Custom module for trade signals and market data
-use polars::prelude::*; // polars: DataFrame library for data manipulation and analysis
-use serde_json::to_writer_pretty; // serde_json: For serializing and deserializing JSON data
-use std::fs::File; // std::fs: For file operations, such as creating and writing to files
-
-pub struct BacktestingEngine { // Engine for running backtests
+// Backtesting Engine
+pub struct BacktestingEngine {
     historical_data: DataFrame,
     strategy: Box<dyn Strategy>,
     trades: Vec<TradeSignal>,
@@ -316,40 +322,40 @@ impl BacktestingEngine {
         }
     }
 
-    pub fn run(&mut self) -> Result<(), Box<dyn Error>> { // Run backtest
+    pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
         let row_count = self.historical_data.height();
         for i in 0..row_count {
             let market_data = self.convert_row_to_market_data(i)?;
             match self.strategy.generate_signal(&market_data) {
                 Ok(signal) => {
                     self.execute_trade(&signal);
-                    self.portfolio_value = self.calculate_portfolio_value(); // Update portfolio value after each trade
+                    self.portfolio_value = self.calculate_portfolio_value();
                 },
                 Err(e) => warn!("Failed to generate signal: {}", e),
             }
         }
 
-        let file = File::create("trades.json")?; // Save results
+        let file = File::create("trades.json")?;
         to_writer_pretty(file, &self.trades)?;
 
         Ok(())
     }
 
-    fn convert_row_to_market_data(&self, index: usize) -> Result<MarketData, Box<dyn Error>> { // Convert DataFrame row to MarketData
+    fn convert_row_to_market_data(&self, index: usize) -> Result<MarketData, Box<dyn Error>> {
         let mut market_data = MarketData::default();
         
-        market_data.symbol = match self.historical_data.column("symbol")?.get(index) { // Extract string fields
+        market_data.symbol = match self.historical_data.column("symbol")?.get(index) {
             Some(AnyValue::String(s)) => s.to_string(),
             _ => return Err("Invalid symbol data".into())
         };
 
-        market_data.price = extract_field!(self.historical_data, "price", index, "price")?; // Extract numeric fields using macro
+        market_data.price = extract_field!(self.historical_data, "price", index, "price")?;
         market_data.volume = extract_field!(self.historical_data, "volume", index, "volume")?;
         market_data.free_cash_flow = extract_field!(self.historical_data, "free_cash_flow", index, "free cash flow")?;
         market_data.current_ratio = extract_field!(self.historical_data, "current_ratio", index, "current ratio")?;
         market_data.quick_ratio = extract_field!(self.historical_data, "quick_ratio", index, "quick ratio")?;
         
-        if let Ok(pe) = extract_field!(self.historical_data, "pe_ratio", index, "PE ratio") { // Handle optional fields
+        if let Ok(pe) = extract_field!(self.historical_data, "pe_ratio", index, "PE ratio") {
             market_data.pe_ratio = pe;
         } else {
             warn!("PE ratio missing at index {}, using default", index);
@@ -358,30 +364,24 @@ impl BacktestingEngine {
         Ok(market_data)
     }
 
-    fn execute_trade(&mut self, signal: &TradeSignal) { // Record trade
+    fn execute_trade(&mut self, signal: &TradeSignal) {
         info!("Executing trade: {:?}", signal);
         self.trades.push(signal.clone());
     }
 
-    fn calculate_portfolio_value(&self) -> f64 { // Calculate current portfolio value
-        let mut total_value = self.available_funds; // Start with available cash
+    fn calculate_portfolio_value(&self) -> f64 {
+        let mut total_value = self.available_funds;
 
-        for position in self.holdings.values() { // Sum up the value of all positions
+        for position in self.holdings.values() {
             total_value += position.quantity as f64 * position.current_price;
         }
 
-        total_value // Return the calculated total portfolio value
+        total_value
     }
+}
 
-// --- Imports and Dependencies ---
-use crate::model::{TradeSignal, PortfolioMetrics, Position}; // crate::model: Custom module for trade signals, portfolio metrics, and positions
-use log::{info, error}; // log: Logging macros for diagnostics and error reporting
-use std::fs::OpenOptions; // std::fs: For file operations, such as opening files with specific options
-use std::io::Write; // std::io: For writing data to files
-use std::error::Error; // std::error: For error handling and propagation
-use chrono::Local; // chrono: Date/time library, used for local timestamps
-
-pub struct ExecutionEngine { // Engine for executing live trades
+// Execution Engine
+pub struct ExecutionEngine {
     available_funds: f64,
     holdings: HashMap<String, Position>,
     metrics: PortfolioMetrics,
@@ -404,7 +404,7 @@ impl ExecutionEngine {
         }
     }
 
-    pub fn execute_trade(&mut self, signal: &TradeSignal) -> Result<(), Box<dyn Error>> { // Execute trade signal
+    pub fn execute_trade(&mut self, signal: &TradeSignal) -> Result<(), Box<dyn Error>> {
         let execution_status = match signal.action.as_str() {
             "buy" => self.execute_buy(signal),
             "sell" => self.execute_sell(signal),
@@ -425,18 +425,18 @@ impl ExecutionEngine {
         }
     }
 
-    fn handle_hold(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> { // Handle hold signals and rebalancing
+    fn handle_hold(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> {
         if let Some(position) = self.holdings.get_mut(&signal.asset) {
-            let new_stop_loss = signal.price * (1.0 - signal.risk_metrics.volatility * 1.5); // Update stop-loss based on volatility
+            let new_stop_loss = signal.price * (1.0 - signal.risk_metrics.volatility * 1.5);
             position.stop_loss = Some(new_stop_loss.max(position.stop_loss.unwrap_or(0.0)));
             if signal.risk_metrics.volatility > 0.0 {
                 position.stop_loss = Some(signal.price * (1.0 - signal.risk_metrics.volatility));
             }
 
-            let target_weight = 1.0 / self.holdings.len() as f64; // Check position drift
+            let target_weight = 1.0 / self.holdings.len() as f64;
             let drift = (position.weight - target_weight).abs();
             
-            if drift > 0.05 { // Rebalance if drift exceeds threshold
+            if drift > 0.05 {
                 let required_adjustment = (target_weight - position.weight) * self.metrics.total_value;
                 let adjustment_quantity = required_adjustment / signal.price;
                 
@@ -457,7 +457,7 @@ impl ExecutionEngine {
         Ok(format!("Holding position in {}. No rebalancing needed.", signal.asset))
     }
 
-    fn execute_buy(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> { // Execute buy orders
+    fn execute_buy(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> {
         let cost = signal.quantity * signal.price;
         
         if cost > self.available_funds {
@@ -479,7 +479,7 @@ impl ExecutionEngine {
                 last_rebalance: Utc::now(),
             });
 
-        let total_cost = position.quantity * position.avg_price + cost; // Update position details
+        let total_cost = position.quantity * position.avg_price + cost;
         let total_quantity = position.quantity + signal.quantity;
         position.avg_price = total_cost / total_quantity;
         position.quantity = total_quantity;
@@ -493,7 +493,7 @@ impl ExecutionEngine {
             signal.quantity, signal.asset, signal.price))
     }
 
-    fn execute_sell(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> { // Execute sell orders
+    fn execute_sell(&mut self, signal: &TradeSignal) -> Result<String, Box<dyn Error>> {
         let position = self.holdings.get_mut(&signal.asset)
             .ok_or_else(|| "No position found for asset".to_string())?;
 
@@ -506,7 +506,7 @@ impl ExecutionEngine {
         self.available_funds += proceeds;
         self.metrics.equity_value -= proceeds;
 
-        if position.quantity == 0.0 { // Update or remove position
+        if position.quantity == 0.0 {
             self.holdings.remove(&signal.asset);
         } else {
             position.market_value = position.quantity * signal.price;
@@ -518,19 +518,19 @@ impl ExecutionEngine {
             signal.quantity, signal.asset, proceeds))
     }
 
-    fn update_portfolio_metrics(&mut self, signal: &TradeSignal) -> Result<(), Box<dyn Error>> { // Update portfolio metrics
+    fn update_portfolio_metrics(&mut self, signal: &TradeSignal) -> Result<(), Box<dyn Error>> {
         let total_positions = self.holdings.len() as f64;
         
         if total_positions == 0.0 {
             self.metrics.diversification_score = 0.0;
             self.metrics.herfindahl_index = 1.0;
         } else {
-            let weights_squared_sum: f64 = self.holdings.values() // Calculate Herfindahl Index for concentration
+            let weights_squared_sum: f64 = self.holdings.values()
                 .map(|p| p.weight.powi(2))
                 .sum();
             self.metrics.herfindahl_index = weights_squared_sum;
             
-            self.metrics.diversification_score = 1.0 - weights_squared_sum; // Calculate diversification score
+            self.metrics.diversification_score = 1.0 - weights_squared_sum;
         }
         
         self.metrics.total_value = self.available_funds + self.metrics.equity_value;
@@ -540,7 +540,6 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    // Log execution status
     fn track_execution_status(&self, status: &str, signal: &TradeSignal) -> Result<(), Box<dyn Error>> {
         let mut file = OpenOptions::new()
             .append(true)
@@ -560,19 +559,12 @@ impl ExecutionEngine {
     }
 }
 
-// Main.rs application entry point
-
-// --- Imports and Dependencies ---
-use log::info; // log: Logging macros for diagnostics
-use env_logger; // env_logger: For initializing the logging environment
-use polars::prelude::*; // polars: DataFrame library for data manipulation and analysis
-use std::path::Path; // std::path: For file path manipulations
-
-#[tokio::main] // Tokio runtime: To run async code in a synchronous context
+// Main Application Entry Point
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init(); // Initialize logging
+    env_logger::init();
 
-    let config = StrategyConfig { // Configure strategy parameters
+    let config = StrategyConfig {
         pe_ratio_threshold: 15.0,
         price_to_book_threshold: 1.0,
         free_cash_flow_threshold: 0.0,
@@ -589,10 +581,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         position_drift_threshold: 0.05,
     };
 
-    let historical_data = CsvReader::from_path(Path::new("historical_data.csv"))? // Load historical data
+    let historical_data = CsvReader::from_path(Path::new("historical_data.csv"))?
         .finish()?;
 
-    let strategy = Box::new(MarketDataStrategy::new(config)); // Initialize and run backtest
+    let strategy = Box::new(MarketDataStrategy::new(config));
     let mut engine = BacktestingEngine::new(historical_data, strategy);
     
     engine.run()?;
