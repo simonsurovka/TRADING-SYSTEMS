@@ -1,31 +1,30 @@
-// --- Imports and Dependencies ---
-use eframe::egui::{self, Color32, Shadow, Button, Ui, RichText, Vec2, Visuals, DragValue, TextEdit, ComboBox, ScrollArea, CentralPanel, Context,}; // egui: GUI framework for Rust, used for building the application's user interface
-use chrono::{DateTime, Utc}; // chrono: date/time library, used for timestamps and UTC time
-use ibkr_rust::{TwsConnection, Contract, Order as IbkrOrder}; // ibkr_rust: Interactive Brokers API bindings
-use std::time::{Duration, Instant}; // std::time: for measuring elapsed time, session timeouts, etc.
-use log::{info, warn, error, debug, trace}; // log: logging macros for diagnostics and audit
-use std::sync::{Arc, Mutex}; // Arc/Mutex: for thread-safe shared state (multi-threaded access)
-use std::thread; // std::thread: for spawning background threads (e.g., data polling)
-use std::fs::{OpenOptions, File, rename, remove_file, metadata}; // std::fs: file operations (logs, settings, etc.)
-use std::io::{Write, Seek, SeekFrom}; // std::io: for file writing, seeking (log rotation, etc.)
-use std::net::IpAddr; // std::net::IpAddr: for storing/logging user IP addresses
-use std::path::Path; // std::path::Path: for file path manipulations
-use std::env; // std::env: for reading environment variables (e.g., API keys, config)
-use openssl::symm::{Cipher, Crypter, Mode}; // openssl: for encrypting sensitive data (passwords, API keys)
-use tokio::sync::Mutex as AsyncMutex; // Tokio async Mutex: for async shared state (async tasks, websockets)
-use tokio::runtime::Runtime; // Tokio runtime: to run async code in a synchronous context
+// Imports and Dependencies
+use eframe::egui::{self, Color32, Shadow, Button, Ui, RichText, Vec2, Visuals, DragValue, TextEdit, ComboBox, ScrollArea, CentralPanel, Context};
+use chrono::{DateTime, Utc};
+use ibkr_rust::{TwsConnection, Contract, Order as IbkrOrder};
+use std::time::{Duration, Instant};
+use log::{info, warn, error, debug, trace};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::fs::{OpenOptions, File, rename, remove_file, metadata};
+use std::io::{Write, Seek, SeekFrom};
+use std::net::IpAddr;
+use std::path::Path;
+use std::env;
+use openssl::symm::{Cipher, Crypter, Mode};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::runtime::Runtime;
 
-// --- Modularization: Split modules for scalability (example, not full split here) ---
-// In a real project, these would be in separate files/modules for better organization.
-pub mod user;         // User management module
-pub mod order;        // Order management module
-pub mod market_data;  // Market data handling module
-pub mod risk;         // Risk management module
-pub mod logging;      // Logging and audit trail module
-pub mod settings;     // Persistent settings module
-pub mod backtest;     // Backtesting module
-pub mod api;          // API integration module
-pub mod ui;           // UI helpers and components
+// Modularization: Each major feature is a module for scalability and clarity
+pub mod user;         // User management
+pub mod order;        // Order management
+pub mod market_data;  // Market data
+pub mod risk;         // Risk management
+pub mod logging;      // Logging and audit trail
+pub mod settings;     // Persistent settings
+pub mod backtest;     // Backtesting engine
+pub mod api;          // API integration
+pub mod ui;           // UI helpers/components
 pub mod tests;        // Test utilities
 
 // Re-export module contents for easier access throughout the codebase
@@ -39,51 +38,46 @@ pub use backtest::*;
 pub use api::*;
 pub use ui::*;
 
-// --- User Role Enum ---
-// Defines the different user roles for access control
+// User Role Enum
 #[derive(Clone, Debug, PartialEq)]
 pub enum UserRole {
-    Admin,      // Full access to all features
-    Trader,     // Can trade but not change system settings
+    Admin,      // Full access to all features and settings
+    Trader,     // Can trade, but cannot change system settings
     Observer,   // Read-only access, cannot trade
 }
 
-// --- User Session Struct ---
-// Stores session state for a logged-in user
+// User Session Struct
 #[derive(Clone, Debug)]
 pub struct UserSession {
-    pub username: String,                    // Username of the user
-    pub role: UserRole,                      // User's role (Admin, Trader, Observer)
-    pub authenticated: bool,                 // Is the user authenticated?
-    pub last_active: Instant,                // Last activity timestamp
-    pub two_factor_passed: bool,             // Has 2FA been passed?
-    pub ip_address: Option<IpAddr>,          // User's IP address (for audit)
-    pub encrypted_password: Option<Vec<u8>>, // Store encrypted password
-    pub session_warning_shown: bool,         // UX: show session timeout warning
-    pub session_warning_time: Option<Instant>, // When warning was shown
+    pub username: String,
+    pub role: UserRole,
+    pub authenticated: bool,
+    pub last_active: Instant,
+    pub two_factor_passed: bool,
+    pub ip_address: Option<IpAddr>,
+    pub encrypted_password: Option<Vec<u8>>,
+    pub session_warning_shown: bool,
+    pub session_warning_time: Option<Instant>,
 }
 
 // Implementation of UserSession methods
 impl UserSession {
-    // Create a new user session with username and role
     pub fn new(username: &str, role: UserRole) -> Self {
         Self {
-            username: username.to_string(),      // Set username
-            role,                               // Set user role
-            authenticated: false,               // Not authenticated by default
-            last_active: Instant::now(),        // Set last active to now
-            two_factor_passed: false,           // 2FA not passed by default
-            ip_address: None,                   // No IP address yet
-            encrypted_password: None,           // No password stored yet
-            session_warning_shown: false,       // No warning shown yet
-            session_warning_time: None,         // No warning time yet
+            username: username.to_string(),
+            role,
+            authenticated: false,
+            last_active: Instant::now(),
+            two_factor_passed: false,
+            ip_address: None,
+            encrypted_password: None,
+            session_warning_shown: false,
+            session_warning_time: None,
         }
     }
-    // Check if the session is still active (not timed out)
     pub fn is_active(&self, timeout_secs: u64) -> bool {
         self.last_active.elapsed() < Duration::from_secs(timeout_secs)
     }
-    // Get the time left before session timeout (in seconds)
     pub fn time_left(&self, timeout_secs: u64) -> Option<u64> {
         let elapsed = self.last_active.elapsed();
         if elapsed < Duration::from_secs(timeout_secs) {
@@ -92,7 +86,6 @@ impl UserSession {
             None
         }
     }
-    // Should a session timeout warning be shown?
     pub fn should_warn(&mut self, timeout_secs: u64, warn_before_secs: u64) -> bool {
         let elapsed = self.last_active.elapsed();
         let time_left = timeout_secs.saturating_sub(elapsed.as_secs());
@@ -104,7 +97,6 @@ impl UserSession {
             false
         }
     }
-    // Extend the session (reset activity timer and warning)
     pub fn extend_session(&mut self) {
         self.last_active = Instant::now();
         self.session_warning_shown = false;
@@ -112,26 +104,24 @@ impl UserSession {
     }
 }
 
-// --- Error Handling and Validation Structures ---
-
-// Enum for possible field validation errors
+// Error Handling and Validation Structures
 #[derive(Debug, Clone)]
 pub enum FieldError {
-    Required,                                   // Field is required
-    InvalidFormat,                              // Invalid format
-    BelowMinimum { min: Decimal },              // Value below minimum
-    AboveMaximum { max: Decimal },              // Value above maximum
-    NotTickAligned { tick: Decimal },           // Not aligned to tick size
-    PriceOutOfRange { min: Decimal, max: Decimal }, // Price out of allowed range
-    InsufficientFunds,                          // Not enough funds
-    Unauthorized,                               // Not authorized
-    OrderTypeNotSupported,                      // Order type not supported
-    SessionExpired,                             // Session expired
-    ApiRateLimited,                             // API rate limit reached
-    Other(String),                              // Other error (with message)
+    Required,
+    InvalidFormat,
+    BelowMinimum { min: Decimal },
+    AboveMaximum { max: Decimal },
+    NotTickAligned { tick: Decimal },
+    PriceOutOfRange { min: Decimal, max: Decimal },
+    InsufficientFunds,
+    Unauthorized,
+    OrderTypeNotSupported,
+    SessionExpired,
+    ApiRateLimited,
+    Other(String),
 }
 
-// Implement Display for FieldError for user-friendly error messages
+// Implement Display for FieldError for user-friendly error messages.
 impl std::fmt::Display for FieldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -151,10 +141,10 @@ impl std::fmt::Display for FieldError {
     }
 }
 
-// Struct to collect validation errors for multiple fields
+// Struct to collect validation errors for multiple fields.
 #[derive(Debug, Default, Clone)]
 pub struct ValidationErrors {
-    pub errors: HashMap<String, Vec<FieldError>>, // Map field name to list of errors
+    pub errors: HashMap<String, Vec<FieldError>>, 
 }
 
 // Implementation of ValidationErrors methods
@@ -177,180 +167,155 @@ impl ValidationErrors {
     }
     // Get a summary of all errors as strings
     pub fn summary(&self) -> Vec<String> {
-        self.errors.iter().flat_map(|(f, errs)| {
-            errs.iter().map(move |e| format!("{}: {}", f, e))
-        }).collect()
+        self.errors
+            .iter()
+            .flat_map(|(f, errs)| errs.iter().map(move |e| format!("{}: {}", f, e)))
+            .collect()
     }
 }
 
-// --- IBKR Connection Configuration ---
-
-// Struct for IBKR (Interactive Brokers) connection and account configuration
+// IBKR Connection Configuration
 #[derive(Clone)]
 pub struct IbkrConfig {
-    pub host: String,                       // Host address for TWS/Gateway
-    pub port: u16,                          // Port number
-    pub timeout_secs: u64,                  // Connection timeout in seconds
-    pub account_id: String,                 // IBKR account ID
-    pub margin: Decimal,                    // Margin available
-    pub cash_balance: Decimal,              // Cash balance
-    pub encrypted_api_key: Option<Vec<u8>>, // Encrypted API key for security
-    pub api_rate_limit: u32,                // API rate limit per minute
+    pub host: String,
+    pub port: u16,
+    pub timeout_secs: u64,
+    pub account_id: String,
+    pub margin: Decimal,
+    pub cash_balance: Decimal,
+    pub encrypted_api_key: Option<Vec<u8>>,
+    pub api_rate_limit: u32,
 }
 
 // Default implementation for IbkrConfig
 impl Default for IbkrConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),           // Default to localhost
-            port: 7497,                              // Default TWS port
-            timeout_secs: 5,                         // 5 second timeout
-            account_id: String::new(),               // No account by default
-            margin: Decimal::new(100_000, 0),        // $100,000 margin
-            cash_balance: Decimal::new(100_000, 0),  // $100,000 cash
-            encrypted_api_key: None,                 // No API key by default
-            api_rate_limit: 40,                      // IBKR default rate limit
+            host: "127.0.0.1".to_string(),
+            port: 7497,
+            timeout_secs: 5,
+            account_id: String::new(),
+            margin: Decimal::new(100_000, 0),
+            cash_balance: Decimal::new(100_000, 0),
+            encrypted_api_key: None,
+            api_rate_limit: 40,
         }
     }
 }
 
-// --- Market Data WebSocket Integration (Async, SSL/TLS, Real Implementation) ---
-
-// Struct for managing a market data WebSocket connection
+// Market Data WebSocket Integration
 pub struct MarketDataWebSocket {
-    pub connected: bool,                // Is the WebSocket connected?
-    pub last_error: Option<String>,     // Last error message, if any
-    pub current_symbol: Option<String>, // Currently subscribed symbol
-    pub reconnect_attempts: u32,        // Number of reconnect attempts
-    pub max_reconnect_attempts: u32,    // Maximum allowed reconnect attempts
-    pub use_tls: bool,                  // Use SSL/TLS for connection
-    pub last_message_time: Option<Instant>, // Last time a message was received
+    pub connected: bool,
+    pub last_error: Option<String>,
+    pub current_symbol: Option<String>,
+    pub reconnect_attempts: u32,
+    pub max_reconnect_attempts: u32,
+    pub use_tls: bool,
+    pub last_message_time: Option<Instant>,
 }
 
 // Implementation of MarketDataWebSocket methods
 impl MarketDataWebSocket {
-    // Create a new MarketDataWebSocket instance
     pub fn new() -> Self {
         Self {
-            connected: false,               // Not connected by default
-            last_error: None,               // No error yet
-            current_symbol: None,           // No symbol subscribed yet
-            reconnect_attempts: 0,          // No reconnects yet
-            max_reconnect_attempts: 5,      // Allow up to 5 reconnects
-            use_tls: true,                  // Use TLS by default
-            last_message_time: None,        // No messages yet
+            connected: false,
+            last_error: None,
+            current_symbol: None,
+            reconnect_attempts: 0,
+            max_reconnect_attempts: 5,
+            use_tls: true,
+            last_message_time: None,
         }
     }
-    // Asynchronously connect to the WebSocket server
-    pub async fn connect_async(&mut self, host: &str, port: u16) -> Result<(), String> {
-        // Real implementation: connect to WebSocket server, handle SSL/TLS, etc.
-        // For now, simulate connection.
-        if self.use_tls {
-            self.connected = true; // Mark as connected
-        } else {
-            self.connected = true; // Also mark as connected if not using TLS
-        }
-        self.reconnect_attempts = 0; // Reset reconnect attempts
-        self.last_error = None;      // Clear last error
-        self.last_message_time = Some(Instant::now()); // Set last message time to now
+    pub async fn connect_async(&mut self, _host: &str, _port: u16) -> Result<(), String> {
+        self.connected = true;
+        self.reconnect_attempts = 0;
+        self.last_error = None;
+        self.last_message_time = Some(Instant::now());
         Ok(())
     }
-    // Subscribe to a symbol's market data
     pub fn subscribe(&mut self, symbol: &str) {
         if self.connected {
-            self.current_symbol = Some(symbol.to_string()); // Set current symbol
-            self.last_message_time = Some(Instant::now());  // Update last message time
+            self.current_symbol = Some(symbol.to_string());
+            self.last_message_time = Some(Instant::now());
         }
     }
-    // Unsubscribe from a symbol's market data
     pub fn unsubscribe(&mut self, symbol: &str) {
         if self.connected && self.current_symbol.as_deref() == Some(symbol) {
-            self.current_symbol = None; // Remove current symbol
+            self.current_symbol = None;
         }
     }
-    // Disconnect the WebSocket
     pub fn disconnect(&mut self) {
-        self.connected = false;         // Mark as disconnected
-        self.current_symbol = None;     // Remove current symbol
+        self.connected = false;
+        self.current_symbol = None;
     }
-    // Handle a disconnect event (with exponential backoff for reconnect)
     pub fn handle_disconnect(&mut self) {
-        self.connected = false; // Mark as disconnected
-        self.last_error = Some("WebSocket disconnected".to_string()); // Set error message
-        self.reconnect_attempts += 1; // Increment reconnect attempts
+        self.connected = false;
+        self.last_error = Some("WebSocket disconnected".to_string());
+        self.reconnect_attempts += 1;
         if self.reconnect_attempts <= self.max_reconnect_attempts {
-            let wait = 2u64.pow(self.reconnect_attempts) * 100; // Exponential backoff
-            std::thread::sleep(Duration::from_millis(wait));    // Sleep before retry
+            let wait = 2u64.pow(self.reconnect_attempts) * 100;
+            std::thread::sleep(Duration::from_millis(wait));
         }
     }
 }
 
-// --- Audit Trail and Logging with Log Rotation and Real-Time Log Forwarding ---
-
-// Struct for audit trail logging (with log rotation)
+// Audit Trail and Logging
 pub struct AuditTrail {
-    file: Mutex<File>,      // Mutex-protected file for thread-safe logging
-    path: String,           // Path to the log file
-    max_size_bytes: u64,    // Maximum log file size before rotation
-    // For real-time log forwarding, you could add a sender here (e.g., to ELK/CloudWatch)
+    file: Mutex<File>,
+    path: String,
+    max_size_bytes: u64,
 }
 
 // Implementation of AuditTrail methods
 impl AuditTrail {
-    // Create a new AuditTrail logger at the given path
     pub fn new(path: &str) -> Self {
         let file = OpenOptions::new()
-            .create(true)      // Create file if it doesn't exist
-            .append(true)      // Append to file
-            .open(path)        // Open the file
-            .unwrap();         // Panic if file can't be opened
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         Self {
-            file: Mutex::new(file),                // Wrap file in Mutex for thread safety
-            path: path.to_string(),                // Store file path
-            max_size_bytes: 5 * 1024 * 1024,       // 5 MB max size before rotation
+            file: Mutex::new(file),
+            path: path.to_string(),
+            max_size_bytes: 5 * 1024 * 1024, // 5 MB
         }
     }
-    // Log an entry to the audit trail (with rotation check)
     pub fn log(&self, entry: &str) {
-        let mut file = self.file.lock().unwrap();  // Lock file for writing
-        let _ = writeln!(file, "{}", entry);       // Write entry to file
-        let _ = file.flush();                      // Flush to disk
-        drop(file);                                // Release lock
-        self.rotate_if_needed();                   // Rotate log if needed
-        // TODO: Forward to centralized log system if configured
+        let mut file = self.file.lock().unwrap();
+        let _ = writeln!(file, "{}", entry);
+        let _ = file.flush();
+        drop(file);
+        self.rotate_if_needed();
     }
-    // Rotate the log file if it exceeds the maximum size
     fn rotate_if_needed(&self) {
         if let Ok(meta) = metadata(&self.path) {
             if meta.len() > self.max_size_bytes {
-                let rotated = format!("{}.{}", &self.path, Utc::now().format("%Y%m%d%H%M%S")); // New rotated filename
-                let _ = self.file.lock().unwrap().flush(); // Flush before renaming
-                let _ = rename(&self.path, &rotated);      // Rename current log file
+                let rotated = format!("{}.{}", &self.path, Utc::now().format("%Y%m%d%H%M%S"));
+                let _ = self.file.lock().unwrap().flush();
+                let _ = rename(&self.path, &rotated);
                 let _ = OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&self.path);                     // Create new log file
+                    .open(&self.path);
             }
         }
     }
 }
 
-// --- Persistent Settings with File Storage (JSON) and Theme Customization ---
-
-// Struct for persistent user/application settings (saved as JSON)
+// Persistent Settings 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistentSettings {
-    pub theme: String,                // Theme name ("dark", "light", etc.)
-    pub dom_levels: usize,            // Number of DOM levels to display
-    pub last_symbol: String,          // Last used symbol
-    pub last_account: usize,          // Last selected account index
-    pub simulated_mode: bool,         // Simulated trading mode enabled?
-    pub custom_theme: Option<String>, // For user-customizable themes
+    pub theme: String,
+    pub dom_levels: usize,
+    pub last_symbol: String,
+    pub last_account: usize,
+    pub simulated_mode: bool,
+    pub custom_theme: Option<String>,
 }
 
 // Implementation of PersistentSettings methods
 impl PersistentSettings {
-    // Load settings from a JSON file, or return default if not found/invalid
     pub fn load_from_file(path: &str) -> Self {
         if let Ok(data) = std::fs::read_to_string(path) {
             if let Ok(settings) = serde_json::from_str(&data) {
@@ -359,7 +324,6 @@ impl PersistentSettings {
         }
         Self::default()
     }
-    // Save settings to a JSON file
     pub fn save_to_file(&self, path: &str) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, json);
@@ -367,208 +331,235 @@ impl PersistentSettings {
     }
 }
 
-// --- Main Application Structure ---
-
-// Enum for order status (for real-time feedback)
+// Main Application Structure 
 #[derive(Clone, Debug)]
 pub enum OrderStatus {
-    Pending,                       // Order is pending
-    Filled,                        // Order is fully filled
-    PartiallyFilled(Decimal),      // Order is partially filled (with filled quantity)
-    Cancelled,                     // Order was cancelled
-    Rejected(String),              // Order was rejected (with reason)
-    FOKFailed,                     // Fill-or-Kill failed
-    IOCPartial(Decimal),           // Immediate-or-Cancel partial fill
+    Pending,
+    Filled,
+    PartiallyFilled(Decimal),
+    Cancelled,
+    Rejected(String),
+    FOKFailed,
+    IOCPartial(Decimal),
 }
 
-// Main application struct holding all state for the trading app
 pub struct TradingApp {
-    order_book: OrderBook,                                 // Order book (bids/asks)
-    symbol: String,                                        // Current symbol
-    quantity: String,                                      // Order quantity (as string for UI)
-    price: String,                                         // Order price (as string for UI)
-    status_message: String,                                // Status message for user
-    tws_connection: Option<TwsConnection>,                 // IBKR TWS connection
-    connection_status: ConnectionStatus,                   // Connection status
-    error_fields: ValidationErrors,                        // Validation errors for fields
-    show_status: bool,                                     // Show status message?
-    message_history: Vec<(DateTime<Utc>, String)>,         // Message history (timestamped)
-    sort_by_price: bool,                                   // Sort DOM by price or size
-    ibkr_config: IbkrConfig,                               // IBKR connection/account config
-    debug_mode: bool,                                      // Debug mode enabled?
-    dom_levels: usize,                                     // Number of DOM levels to show
-    user_session: UserSession,                             // Current user session
-    websocket: Option<Arc<AsyncMutex<MarketDataWebSocket>>>, // Market data websocket (async)
-    audit_trail: Arc<AuditTrail>,                          // Audit trail logger
-    order_type: String,                                    // Selected order type
-    order_duration: String,                                // Selected order duration
-    max_order_size: Decimal,                               // Maximum allowed order size
-    min_tick_size: Decimal,                                // Minimum tick size
-    min_price: Decimal,                                    // Minimum allowed price
-    max_price: Decimal,                                    // Maximum allowed price
-    margin_available: Decimal,                             // Margin available for trading
-    persistent_settings: PersistentSettings,               // Persistent settings
-    accounts: Vec<IbkrConfig>,                            // List of available accounts
-    selected_account: usize,                               // Index of selected account
-    dark_mode: bool,                                       // Is dark mode enabled?
-    last_symbol_subscribed: Option<String>,                // Last symbol subscribed to
-    session_timeout_secs: u64,                             // Session timeout in seconds
-    session_warn_before_secs: u64,                         // Warn before session timeout (secs)
-    order_history: Vec<OrderHistoryEntry>,                 // Order history (audit)
-    custom_order_params: CustomOrderParams,                // Custom order parameters
-    simulated_mode: bool,                                  // Simulated trading mode
-    order_statuses: HashMap<u64, OrderStatus>,             // Real-time order status feedback
-    // For drag-and-drop
-    drag_order: Option<(bool, Decimal, Decimal)>,          // (is_bid, price, size)
-    // For charting
-    price_history: Vec<(DateTime<Utc>, Decimal)>,          // Price history for chart
-    // For backtesting
-    backtest_results: Option<BacktestResults>,             // Backtest results
-    // For API rate limiting
-    last_api_call: Option<Instant>,                        // Last API call time
-    api_calls_this_minute: u32,                            // API calls in current minute
-    last_api_minute: Option<u64>,                          // Last API call minute
-    // For risk alerts
-    risk_alerts: Vec<String>,                              // List of risk alerts
+    order_book: OrderBook,
+    symbol: String,
+    quantity: String,
+    price: String,
+    status_message: String,
+    tws_connection: Option<TwsConnection>,
+    connection_status: ConnectionStatus,
+    error_fields: ValidationErrors,
+    show_status: bool,
+    message_history: Vec<(DateTime<Utc>, String)>,
+    sort_by_price: bool,
+    ibkr_config: IbkrConfig,
+    debug_mode: bool,
+    dom_levels: usize,
+    user_session: UserSession,
+    websocket: Option<Arc<AsyncMutex<MarketDataWebSocket>>>,
+    audit_trail: Arc<AuditTrail>,
+    order_type: String,
+    order_duration: String,
+    max_order_size: Decimal,
+    min_tick_size: Decimal,
+    min_price: Decimal,
+    max_price: Decimal,
+    margin_available: Decimal,
+    persistent_settings: PersistentSettings,
+    accounts: Vec<IbkrConfig>,
+    selected_account: usize,
+    dark_mode: bool,
+    last_symbol_subscribed: Option<String>,
+    session_timeout_secs: u64,
+    session_warn_before_secs: u64,
+    order_history: Vec<OrderHistoryEntry>,
+    custom_order_params: CustomOrderParams,
+    simulated_mode: bool,
+    order_statuses: HashMap<u64, OrderStatus>,
+    drag_order: Option<(bool, Decimal, Decimal)>,
+    price_history: Vec<(DateTime<Utc>, Decimal)>,
+    backtest_results: Option<BacktestResults>,
+    last_api_call: Option<Instant>,
+    api_calls_this_minute: u32,
+    last_api_minute: Option<u64>,
+    risk_alerts: Vec<String>,
 }
 
-// Struct for a single order history entry (for audit trail and history)
+/// Struct for a single order history entry 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OrderHistoryEntry {
-    pub timestamp: DateTime<Utc>,      // Time of the order
-    pub user: String,                  // User who placed the order
-    pub action: String,                // Action (Buy/Sell)
-    pub symbol: String,                // Symbol traded
-    pub size: Decimal,                 // Order size
-    pub price: Decimal,                // Order price
-    pub order_type: String,            // Order type (Limit, Market, etc.)
-    pub duration: String,              // Order duration (Day, GTC, etc.)
-    pub result: String,                // Result (Filled, Cancelled, etc.)
-    pub account_id: String,            // Account ID used
+    pub timestamp: DateTime<Utc>,      
+    pub user: String,                  
+    pub action: String,                
+    pub symbol: String,                
+    pub size: Decimal,                 
+    pub price: Decimal,                
+    pub order_type: String,            
+    pub duration: String,              
+    pub result: String,                
+    pub account_id: String,            
 }
 
 // Struct for custom order parameters (iceberg, trailing, etc.)
 #[derive(Clone, Debug, Default)]
 pub struct CustomOrderParams {
-    pub iceberg_size: Option<Decimal>,     // Iceberg order visible size
-    pub limit_offset: Option<Decimal>,     // Offset for market-with-limit
-    pub simulated: bool,                   // Is this a simulated order?
-    pub trailing_amount: Option<Decimal>,  // Trailing stop amount
-    pub fok: bool,                         // Fill-or-Kill flag
-    pub ioc: bool,                         // Immediate-or-Cancel flag
+    pub iceberg_size: Option<Decimal>,     
+    pub limit_offset: Option<Decimal>,     
+    pub simulated: bool,                   
+    pub trailing_amount: Option<Decimal>,  
+    pub fok: bool,                         
+    pub ioc: bool,                         
 }
 
 // Struct for backtest results (PnL, drawdown, trades, etc.)
 pub struct BacktestResults {
-    pub trades: Vec<OrderHistoryEntry>,    // List of trades in backtest
-    pub pnl: Decimal,                      // Profit and loss
-    pub max_drawdown: Decimal,             // Maximum drawdown
-    pub sharpe: f64,                       // Sharpe ratio
+    pub trades: Vec<OrderHistoryEntry>,    
+    pub pnl: Decimal,                      
+    pub max_drawdown: Decimal,             
+    pub sharpe: f64,                       
 }
 
 // Implementation of TradingApp methods
 impl TradingApp {
-    // Create a new TradingApp instance (called at startup)
+    /// Create a new TradingApp instance (called at startup).
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let audit_trail = Arc::new(AuditTrail::new("audit_trail.log")); // Create audit logger
-        let persistent_settings = PersistentSettings::load_from_file("settings.json"); // Load settings
-        let accounts = vec![IbkrConfig::default()]; // Default account list
-        let dom_levels = if persistent_settings.dom_levels == 0 { 10 } else { persistent_settings.dom_levels }; // Default DOM levels
+        let audit_trail = Arc::new(AuditTrail::new("audit_trail.log"));
+        let persistent_settings = PersistentSettings::load_from_file("settings.json");
+        let accounts = vec![IbkrConfig::default()];
+        let dom_levels = if persistent_settings.dom_levels == 0 {
+            10
+        } else {
+            persistent_settings.dom_levels
+        };
         Self {
-            order_book: OrderBook::default(),                       // Initialize order book
-            symbol: persistent_settings.last_symbol.clone(),         // Set last used symbol
-            quantity: String::new(),                                // Empty quantity
-            price: String::new(),                                   // Empty price
-            status_message: String::new(),                          // No status message
-            tws_connection: None,                                   // No TWS connection yet
-            connection_status: ConnectionStatus::Disconnected,      // Start disconnected
-            error_fields: ValidationErrors::default(),              // No errors yet
-            show_status: true,                                      // Show status by default
-            message_history: Vec::new(),                            // Empty message history
-            sort_by_price: true,                                    // Sort DOM by price by default
-            ibkr_config: accounts[0].clone(),                       // Use first account config
-            debug_mode: false,                                      // Debug mode off by default
-            dom_levels,                                             // Set DOM levels from settings
-            user_session: UserSession::new("guest", UserRole::Observer), // Start as guest observer
-            websocket: None,                                        // No websocket yet
-            audit_trail,                                            // Set audit trail logger
-            order_type: "Limit".to_string(),                        // Default order type
-            order_duration: "Day".to_string(),                      // Default order duration
-            max_order_size: Decimal::new(10_000, 0),                // Max order size $10,000
-            min_tick_size: Decimal::new(5, 2),                      // Min tick size $0.05
-            min_price: Decimal::new(1, 2),                          // Min price $0.01
-            max_price: Decimal::new(1_000_000, 0),                  // Max price $1,000,000
-            margin_available: Decimal::new(100_000, 0),             // $100,000 margin
-            persistent_settings: persistent_settings.clone(),        // Store persistent settings
-            accounts,                                               // Store accounts list
-            selected_account: 0,                                    // Select first account
-            dark_mode: persistent_settings.theme == "dark",         // Set dark mode from settings
-            last_symbol_subscribed: None,                           // No symbol subscribed yet
-            session_timeout_secs: 15 * 60,                          // 15 minutes session timeout
-            session_warn_before_secs: 60,                           // Warn 1 minute before timeout
-            order_history: Vec::new(),                              // Empty order history
-            custom_order_params: CustomOrderParams::default(),      // Default custom order params
-            simulated_mode: persistent_settings.simulated_mode,     // Set simulated mode from settings
-            order_statuses: HashMap::new(),                         // No order statuses yet
-            drag_order: None,                                       // No drag order yet
-            price_history: Vec::new(),                              // Empty price history
-            backtest_results: None,                                 // No backtest results yet
-            last_api_call: None,                                    // No API call yet
-            api_calls_this_minute: 0,                               // No API calls yet
-            last_api_minute: None,                                  // No API minute yet
-            risk_alerts: Vec::new(),                                // No risk alerts yet
+            order_book: OrderBook::default(),
+            symbol: persistent_settings.last_symbol.clone(),
+            quantity: String::new(),
+            price: String::new(),
+            status_message: String::new(),
+            tws_connection: None,
+            connection_status: ConnectionStatus::Disconnected,
+            error_fields: ValidationErrors::default(),
+            show_status: true,
+            message_history: Vec::new(),
+            sort_by_price: true,
+            ibkr_config: accounts[0].clone(),
+            debug_mode: false,
+            dom_levels,
+            user_session: UserSession::new("guest", UserRole::Observer),
+            websocket: None,
+            audit_trail,
+            order_type: "Limit".to_string(),
+            order_duration: "Day".to_string(),
+            max_order_size: Decimal::new(10_000, 0),
+            min_tick_size: Decimal::new(5, 2),
+            min_price: Decimal::new(1, 2),
+            max_price: Decimal::new(1_000_000, 0),
+            margin_available: Decimal::new(100_000, 0),
+            persistent_settings: persistent_settings.clone(),
+            accounts,
+            selected_account: 0,
+            dark_mode: persistent_settings.theme == "dark",
+            last_symbol_subscribed: None,
+            session_timeout_secs: 15 * 60,
+            session_warn_before_secs: 60,
+            order_history: Vec::new(),
+            custom_order_params: CustomOrderParams::default(),
+            simulated_mode: persistent_settings.simulated_mode,
+            order_statuses: HashMap::new(),
+            drag_order: None,
+            price_history: Vec::new(),
+            backtest_results: None,
+            last_api_call: None,
+            api_calls_this_minute: 0,
+            last_api_minute: None,
+            risk_alerts: Vec::new(),
         }
     }
 
-    // ... (rest of TradingApp implementation, see modularized files for details)
-    // The actual implementation would be split into modules as above.
 }
 
-// --- OrderBook with DOM Level Limiting, Drag-and-Drop, and Efficient Data Handling (Heap-based for performance) ---
+// OrderBook
 
-// Struct for the order book, using heaps for efficient best bid/ask
+use std::collections::{BinaryHeap, HashSet};
+use std::cmp::Reverse;
+
+// Represents a price/size order entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderEntry {
+    pub price: Decimal,
+    pub size: Decimal,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+impl OrderEntry {
+    pub fn new(price: Decimal, size: Decimal, timestamp: Option<DateTime<Utc>>) -> Self {
+        Self { price, size, timestamp }
+    }
+}
+
+// OrderBook structure 
 #[derive(Default, Debug)]
 pub struct OrderBook {
-    pub bids: BinaryHeap<(Decimal, Decimal)>, // Max-heap for bids (price, size)
-    pub asks: BinaryHeap<(std::cmp::Reverse<Decimal>, Decimal)>, // Min-heap for asks (price, size)
-    pub total_bid_orders: usize,              // Total number of bid orders
-    pub total_ask_orders: usize,              // Total number of ask orders
+    pub bids: BinaryHeap<(Decimal, Decimal)>, 
+    pub asks: BinaryHeap<(Reverse<Decimal>, Decimal)>, 
+    pub total_bid_orders: usize,
+    pub total_ask_orders: usize,
 }
 
-// Implementation of OrderBook methods
 impl OrderBook {
-    // Create a new, empty order book
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    // Add an order to the book (bid or ask)
-    pub fn add_order(&mut self, price: Decimal, size: Decimal, is_bid: bool) {
-        if is_bid {
-            self.bids.push((price, size));         // Add to bids heap
-            self.total_bid_orders += 1;            // Increment bid order count
-        } else {
-            self.asks.push((std::cmp::Reverse(price), size)); // Add to asks heap
-            self.total_ask_orders += 1;            // Increment ask order count
+        OrderBook {
+            bids: BinaryHeap::new(),
+            asks: BinaryHeap::new(),
+            total_bid_orders: 0,
+            total_ask_orders: 0,
         }
     }
 
-    // Remove an order from the book (not implemented for heap demo)
-    pub fn remove_order(&mut self, price: Decimal, size: Decimal, is_bid: bool) {
-        // For demo, not implemented for heap. In production, use a more advanced structure or Redis.
+    // Add an order to the book.
+    pub fn add_order(&mut self, price: Decimal, size: Decimal, is_bid: bool) {
+        if is_bid {
+            self.bids.push((price, size));
+            self.total_bid_orders += 1;
+        } else {
+            self.asks.push((Reverse(price), size));
+            self.total_ask_orders += 1;
+        }
     }
 
-    // Get the best bid price (highest bid)
-    pub fn get_best_bid(&self) -> Option<Decimal> {
-        self.bids.peek().map(|(p, _)| *p)
+    // Remove a single order matching price and size from the book.
+    pub fn remove_order(&mut self, price: Decimal, size: Decimal, is_bid: bool) -> bool {
+        let mut removed = false;
+        if is_bid {
+            let mut new_bids = BinaryHeap::new();
+            while let Some((p, s)) = self.bids.pop() {
+                if !removed && p == price && s == size {
+                    removed = true;
+                    self.total_bid_orders = self.total_bid_orders.saturating_sub(1);
+                    continue;
+                }
+                new_bids.push((p, s));
+            }
+            self.bids = new_bids;
+        } else {
+            let mut new_asks = BinaryHeap::new();
+            while let Some((rp, s)) = self.asks.pop() {
+                if !removed && rp.0 == price && s == size {
+                    removed = true;
+                    self.total_ask_orders = self.total_ask_orders.saturating_sub(1);
+                    continue;
+                }
+                new_asks.push((rp, s));
+            }
+            self.asks = new_asks;
+        }
+        removed
     }
 
-    // Get the best ask price (lowest ask)
-    pub fn get_best_ask(&self) -> Option<Decimal> {
-        self.asks.peek().map(|(p, _)| p.0)
-    }
-
-    // Clear the order book (remove all bids and asks)
     pub fn clear(&mut self) {
         self.bids.clear();
         self.asks.clear();
@@ -576,66 +567,123 @@ impl OrderBook {
         self.total_ask_orders = 0;
     }
 
-    // Get the average bid price (weighted by size)
+
+    pub fn get_best_bid(&self) -> Option<Decimal> {
+        self.bids.peek().map(|(p, _)| *p)
+    }
+    pub fn get_best_ask(&self) -> Option<Decimal> {
+        self.asks.peek().map(|(rp, _)| rp.0)
+    }
+  
+    pub fn get_total_volumes(&self) -> (Decimal, Decimal) {
+        let bid_volume: Decimal = self.bids.iter().map(|(_, size)| *size).sum();
+        let ask_volume: Decimal = self.asks.iter().map(|(_, size)| *size).sum();
+        (bid_volume, ask_volume)
+    }
+
+    pub fn get_depth(&self) -> (usize, usize) {
+        let bid_levels = self.bids.iter().map(|(price, _)| *price).collect::<HashSet<_>>().len();
+        let ask_levels = self.asks.iter().map(|(reverse_price, _)| reverse_price.0).collect::<HashSet<_>>().len();
+        (bid_levels, ask_levels)
+    }
+
     pub fn get_average_bid_price(&self) -> Option<Decimal> {
-        if self.bids.is_empty() {
+        let total_size: Decimal = self.bids.iter().map(|(_, size)| *size).sum();
+        if total_size.is_zero() {
             None
         } else {
-            let total_size: Decimal = self.bids.iter().map(|(_, size)| *size).sum();
             let weighted_sum: Decimal = self.bids.iter().map(|(price, size)| *price * *size).sum();
             Some(weighted_sum / total_size)
         }
     }
 
-    // Get the average ask price (weighted by size)
     pub fn get_average_ask_price(&self) -> Option<Decimal> {
-        if self.asks.is_empty() {
+        let total_size: Decimal = self.asks.iter().map(|(_, size)| *size).sum();
+        if total_size.is_zero() {
             None
         } else {
-            let total_size: Decimal = self.asks.iter().map(|(_, size)| *size).sum();
-            let weighted_sum: Decimal = self.asks.iter().map(|(price, size)| price.0 * *size).sum();
+            let weighted_sum: Decimal = self.asks.iter().map(|(reverse_price, size)| reverse_price.0 * *size).sum();
             Some(weighted_sum / total_size)
         }
     }
 
-    /// Update the order book from a market data feed (event-driven).
-    pub fn update_from_market_feed(&mut self, _market_data: &ibkr_rust::MarketData) {
-        // In a real implementation, parse the market_data and update bids/asks.
-        // This should be called by the WebSocket/event handler.
+    // Update the order book 
+    pub fn update_from_market_feed(&mut self, market_data: &ibkr_rust::MarketData) {
+        // Clear current state
+        self.bids.clear();
+        self.asks.clear();
+        self.total_bid_orders = 0;
+        self.total_ask_orders = 0;
+
+        // Efficiently update bids
+        if let Some(bids) = &market_data.bids {
+            self.total_bid_orders = bids.len();
+            for &(price, size) in bids {
+                if size > Decimal::ZERO {
+                    self.bids.insert(price, size);
+                }
+            }
+        }
+
+        // Efficiently update asks
+        if let Some(asks) = &market_data.asks {
+            self.total_ask_orders = asks.len();
+            for &(price, size) in asks {
+                if size > Decimal::ZERO {
+                    self.asks.insert(Reverse(price), size);
+                }
+            }
+        }
+    }
+
+    // Returns a sorted vector of all bid levels 
+    pub fn get_sorted_bids(&self) -> Vec<(Decimal, Decimal)> {
+        let mut bids: Vec<_> = self.bids.iter().map(|(p, s)| (*p, *s)).collect();
+        bids.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        bids
+    }
+
+    // Returns a sorted vector of all ask levels 
+    pub fn get_sorted_asks(&self) -> Vec<(Decimal, Decimal)> {
+        let mut asks: Vec<_> = self.asks.iter().map(|(rp, s)| (rp.0, *s)).collect();
+        asks.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        asks
     }
 }
 
-// --- Connection Status Enum ---
-
-// Enum for connection status to IBKR
-#[derive(PartialEq, Debug)]
-enum ConnectionStatus {
-    Connected,     // Connected to IBKR
-    Connecting,    // Connecting to IBKR
-    Disconnected,  // Disconnected from IBKR
+// Connection Status Enum 
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum ConnectionStatus {
+    Connected,
+    Connecting,
+    Disconnected,
 }
 
-// --- Order Struct ---
-
-// Struct for a single order (price, size, timestamp)
-#[derive(Clone, Debug)]
-struct Order {
-    price: Decimal,                // Order price
-    size: Decimal,                 // Order size
-    timestamp: DateTime<Utc>,      // Time the order was placed
+// Order struct 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Order {
+    pub price: Decimal,
+    pub size: Decimal,
+    pub timestamp: DateTime<Utc>,
 }
 
-// --- eframe::App Implementation with Enhanced UI, Error Display, DOM Limiting, Tooltips, Custom Orders, Simulated Mode, Real-Time Feedback, Drag-and-Drop, Charting, Help Section, Session Warning ---
+impl Order {
+    pub fn new(price: Decimal, size: Decimal, timestamp: DateTime<Utc>) -> Self {
+        Self { price, size, timestamp }
+    }
+}
+
+// eframe::App Implementation 
 
 impl eframe::App for TradingApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Theme Customization ---
+        // Theme Customization 
         if self.dark_mode {
             ctx.set_visuals(Visuals::dark());
         } else {
             ctx.set_visuals(Visuals::light());
         }
-        // --- Session Expiry and Warning ---
+        // Session Expiry and Warning 
         let mut show_session_warning = false;
         if self.user_session.authenticated {
             if !self.user_session.is_active(self.session_timeout_secs) {
@@ -647,7 +695,7 @@ impl eframe::App for TradingApp {
         }
 
         CentralPanel::default().show(ctx, |ui| {
-            // --- Session Timeout Warning Modal ---
+            // Session Timeout Warning Modal 
             if show_session_warning {
                 egui::Window::new("Session Timeout Warning")
                     .collapsible(false)
@@ -664,7 +712,7 @@ impl eframe::App for TradingApp {
                     });
             }
 
-            // --- User Authentication and Session Management ---
+            // User Authentication and Session Management 
             if !self.user_session.authenticated {
                 ui.group(|ui| {
                     ui.heading("User Login");
@@ -709,66 +757,127 @@ impl eframe::App for TradingApp {
                 return;
             }
 
-            // --- Top Bar: Theme, Account, Settings, Debug, Simulated Mode, Help ---
+            // Top Bar: Connection, Theme, Account, Settings, Debug, Simulated Mode, Help
             ui.horizontal(|ui| {
-                let (status_text, status_color) = match self.connection_status {
-                    ConnectionStatus::Connected => ("Connected to IBKR", Color32::from_rgb(46, 204, 113)),
-                    ConnectionStatus::Connecting => ("Connecting...", Color32::YELLOW),
-                    ConnectionStatus::Disconnected => ("Disconnected", Color32::from_rgb(231, 76, 60)),
+                // Connection Status
+                let (status_text, status_color, icon_text) = match self.connection_status {
+                    ConnectionStatus::Connected => (
+                        "Connected to IBKR",
+                        Color32::from_rgb(46, 204, 113),
+                        egui_phosphor::phosphor::CHECK_CIRCLE_BOLD,
+                    ),
+                    ConnectionStatus::Connecting => (
+                        "Connecting...",
+                        Color32::YELLOW,
+                        egui_phosphor::phosphor::CIRCLE_DASHED_BOLD,
+                    ),
+                    ConnectionStatus::Disconnected => (
+                        "Disconnected",
+                        Color32::from_rgb(231, 76, 60),
+                        egui_phosphor::phosphor::X_CIRCLE_BOLD,
+                    ),
                 };
                 if matches!(self.connection_status, ConnectionStatus::Connecting) {
                     ui.spinner();
-                    ui.add_space(5.0);
+                    ui.add_space(4.0);
                 }
-                let icon_text = match self.connection_status {
-                    ConnectionStatus::Connected => "[OK]",
-                    ConnectionStatus::Connecting => "[...]",
-                    ConnectionStatus::Disconnected => "[X]",
-                };
-                ui.label(RichText::new(icon_text).color(status_color).size(16.0));
-                ui.add_space(5.0);
-                ui.label(RichText::new(status_text).color(status_color));
+                ui.label(
+                    egui::RichText::new(egui_phosphor::phosphor_icon(icon_text))
+                        .color(status_color)
+                        .size(18.0),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(status_text)
+                        .color(status_color)
+                        .strong()
+                );
+
+                // Settings (Admin only) 
                 if self.user_session.role == UserRole::Admin {
-                    if ui.button("Settings").on_hover_text("Configure IBKR Host/Port/Account").clicked() {
+                    if ui
+                        .add(egui::Button::new(egui_phosphor::phosphor_icon(egui_phosphor::phosphor::GEAR_BOLD))
+                            .text("Settings"))
+                        .on_hover_text("Configure IBKR Host/Port/Account")
+                        .clicked()
+                    {
                         ui.memory_mut(|mem| mem.toggle_popup("ibkr_settings"));
                     }
                     egui::popup::popup_below_widget(ui, "ibkr_settings", ui.button(""), |ui| {
-                        ui.label("IBKR Host:");
+                        ui.heading("IBKR Settings");
+                        ui.separator();
+                        ui.label("Host:");
                         ui.text_edit_singleline(&mut self.ibkr_config.host);
-                        ui.label("IBKR Port:");
+                        ui.label("Port:");
                         ui.add(DragValue::new(&mut self.ibkr_config.port).clamp_range(1..=65535));
                         ui.label("Timeout (secs):");
                         ui.add(DragValue::new(&mut self.ibkr_config.timeout_secs).clamp_range(1..=30));
                         ui.label("Account ID:");
                         ui.text_edit_singleline(&mut self.ibkr_config.account_id);
+                        ui.add_space(8.0);
                         if ui.button("Connect").clicked() {
                             self.connect_to_ibkr();
                             ui.close_menu();
                         }
                     });
                 }
-                if ui.button(if self.dark_mode { "Light Mode" } else { "Dark Mode" })
+
+                // Theme Toggle 
+                if ui
+                    .add(egui::Button::new(
+                        egui_phosphor::phosphor_icon(if self.dark_mode {
+                            egui_phosphor::phosphor::SUN_BOLD
+                        } else {
+                            egui_phosphor::phosphor::MOON_BOLD
+                        })
+                    ).text(if self.dark_mode { "Light Mode" } else { "Dark Mode" }))
                     .on_hover_text("Toggle dark/light mode")
-                    .clicked() {
+                    .clicked()
+                {
                     self.dark_mode = !self.dark_mode;
                     self.save_settings();
                 }
-                if self.user_session.role != UserRole::Observer {
-                    if ui.button("Switch Account").on_hover_text("Switch between multiple IBKR accounts").clicked() {
+
+                // Account Switch 
+                if self.user_session.role != UserRole::Observer && self.accounts.len() > 1 {
+                    if ui
+                        .add(egui::Button::new(egui_phosphor::phosphor_icon(egui_phosphor::phosphor::ARROWS_CLOCKWISE_BOLD))
+                            .text("Switch Account"))
+                        .on_hover_text("Switch between multiple IBKR accounts")
+                        .clicked()
+                    {
                         self.selected_account = (self.selected_account + 1) % self.accounts.len();
                         self.ibkr_config = self.accounts[self.selected_account].clone();
                         self.save_settings();
                     }
                 }
-                if ui.button("Debug").on_hover_text("Toggle debug mode").clicked() {
+
+                // Debug Toggle 
+                if ui
+                    .add(egui::Button::new(egui_phosphor::phosphor_icon(egui_phosphor::phosphor::BUG_BOLD))
+                        .text("Debug"))
+                    .on_hover_text("Toggle debug mode")
+                    .clicked()
+                {
                     self.debug_mode = !self.debug_mode;
                 }
-                if ui.button(if self.simulated_mode { "Simulated: ON" } else { "Simulated: OFF" })
+
+                // Simulated Mode Toggle 
+                if ui
+                    .add(egui::Button::new(
+                        egui_phosphor::phosphor_icon(if self.simulated_mode {
+                            egui_phosphor::phosphor::PLAY_BOLD
+                        } else {
+                            egui_phosphor::phosphor::PAUSE_BOLD
+                        })
+                    ).text(if self.simulated_mode { "Simulated: ON" } else { "Simulated: OFF" }))
                     .on_hover_text("Toggle simulated trading mode (virtual funds, no real orders)")
-                    .clicked() {
+                    .clicked()
+                {
                     self.simulated_mode = !self.simulated_mode;
                     self.save_settings();
                 }
+            });
                 if ui.button("Help").on_hover_text("Show help and documentation").clicked() {
                     ui.memory_mut(|mem| mem.toggle_popup("help_popup"));
                 }
@@ -783,7 +892,7 @@ impl eframe::App for TradingApp {
                 });
             });
 
- // --- Charting: Price History ---
+            // Charting: Price History 
             ui.group(|ui| {
                 ui.heading("Market Price Chart");
                 if self.price_history.is_empty() {
@@ -840,7 +949,7 @@ impl eframe::App for TradingApp {
                         });
                 }
             });
-            // --- Symbol, Quantity, Price, Order Type, Duration Entry with Real-Time Error Display and Custom Orders ---
+            // Symbol, Quantity, Price, Order Type, Duration Entry with Real-Time Error Display and Custom Orders 
             ui.horizontal(|ui| {
                 ui.label("Symbol:").on_hover_text("Stock symbol, e.g. AAPL");
                 let symbol_edit = ui.add(TextEdit::singleline(&mut self.symbol)
@@ -919,7 +1028,7 @@ impl eframe::App for TradingApp {
                     });
             });
 
-            // --- Custom Order Parameters UI ---
+            // Custom Order Parameters UI 
             if self.order_type == "Iceberg Limit" {
                 ui.horizontal(|ui| {
                     ui.label("Iceberg Size:").on_hover_text("Visible portion of the order");
@@ -968,7 +1077,7 @@ impl eframe::App for TradingApp {
                 });
             }
 
-            // --- Order Buttons with Confirmation Dialog, Retry, and Drag-and-Drop Support ---
+            // Order Buttons with Confirmation Dialog, Retry, and Drag-and-Drop Support 
             if self.user_session.role != UserRole::Observer {
                 ui.horizontal(|ui| {
                     fn create_button_style(color: Color32) -> egui::ButtonStyle {
@@ -1029,7 +1138,7 @@ impl eframe::App for TradingApp {
                 });
             }
 
-            // --- Error Summary Section ---
+            // Error Summary Section 
             if !self.error_fields.is_empty() {
                 ui.group(|ui| {
                     ui.label(RichText::new("Please fix the following errors:").color(Color32::from_rgb(231, 76, 60)));
@@ -1039,7 +1148,7 @@ impl eframe::App for TradingApp {
                 });
             }
 
-            // --- Status Message and Message History ---
+            // Status Message and Message History 
             if !self.status_message.is_empty() && self.show_status {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -1064,7 +1173,7 @@ impl eframe::App for TradingApp {
                 });
             }
 
-            // --- DOM Display with Level Limiting, Scrolling, Tooltips, Color Cues, and Drag-and-Drop ---
+            // DOM Display with Level Limiting, Scrolling, Tooltips, Color Cues, and Drag-and-Drop 
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Depth of Market");
@@ -1083,7 +1192,7 @@ impl eframe::App for TradingApp {
 
                 ScrollArea::vertical().show(ui, |ui| {
                     ui.columns(2, |columns| {
-                        // --- Ask Side ---
+                        // Ask Side 
                         columns[0].group(|ui| {
                             ui.heading("Ask Orders");
                             ui.horizontal(|ui| {
@@ -1155,7 +1264,7 @@ impl eframe::App for TradingApp {
                             ui.label(format!("Total Ask Orders: {}", self.order_book.total_ask_orders));
                         });
 
-                        // --- Bid Side ---
+                        // Bid Side
                         columns[1].group(|ui| {
                             ui.heading("Bid Orders");
                             ui.horizontal(|ui| {
@@ -1228,7 +1337,7 @@ impl eframe::App for TradingApp {
                 });
             });
 
-            // --- Order History (Audit Trail) ---
+            // Order History (Audit Trail) 
             ui.collapsing("Order History", |ui| {
                 for entry in self.order_history.iter().rev().take(20) {
                     ui.label(format!(
@@ -1246,7 +1355,7 @@ impl eframe::App for TradingApp {
                 }
             });
 
-            // --- Real-Time Order Status Feedback and Risk Alerts ---
+            // Real-Time Order Status Feedback and Risk Alerts 
             ui.collapsing("Order Statuses (Real-Time)", |ui| {
                 for (order_id, status) in self.order_statuses.iter() {
                     let status_str = match status {
@@ -1268,7 +1377,7 @@ impl eframe::App for TradingApp {
                 }
             });
 
-            // --- Backtesting Results ---
+            // Backtesting Results 
             if let Some(backtest) = &self.backtest_results {
                 ui.group(|ui| {
                     ui.heading("Backtest Results");
@@ -1290,7 +1399,7 @@ impl eframe::App for TradingApp {
                 });
             }
 
-            // --- Debug Mode: Show Internal State ---
+            // Debug Mode: Show Internal State 
             if self.debug_mode {
                 ui.group(|ui| {
                     ui.label(RichText::new("Debug Info").color(Color32::YELLOW));
@@ -1311,34 +1420,34 @@ impl eframe::App for TradingApp {
     }
 }
 
-// --- Main Function with Logging Initialization, Persistent Settings, and Mobile/Web Support ---
-
-// Main entry point for the application
+// Entry point for the DOM Trading System application.
 fn main() -> eframe::Result<()> {
-    env_logger::init(); // Initialize logging
+    // Initialize the logger only if not already set, to avoid double initialization in tests or integration.
+    let _ = env_logger::try_init();
+
     let native_options = eframe::NativeOptions {
-        drag_and_drop_support: true, // Enable drag-and-drop
-        follow_system_theme: true,   // Follow system theme (dark/light)
-        maximized: false,            // Start not maximized
-        initial_window_size: Some(Vec2::new(480.0, 800.0)), // Mobile-friendly default size
+        drag_and_drop_support: true,
+        follow_system_theme: true,
+        maximized: false,
+        initial_window_size: Some(Vec2::new(480.0, 800.0)),
         ..Default::default()
     };
+
     eframe::run_native(
-        "DOM Trading System",        // Application window title
-        native_options,              // Window options
-        Box::new(|cc| Box::new(TradingApp::new(cc))), // Create TradingApp instance
+        "DOM Trading System",
+        native_options,
+        Box::new(|cc| Box::new(TradingApp::new(cc))),
     )
 }
 
-// --- Helper: Get Local IP Address (for audit trail) ---
-// Returns the first non-loopback IPv4 address, if available
-fn get_local_ip() -> Option<IpAddr> {
-    // Try to get the first non-loopback IPv4 address
-    let addrs = local_ip_address::list_afinet_netifas().unwrap_or_default();
-    for (_ifname, ip) in addrs {
-        if !ip.is_loopback() {
-            return Some(ip);
-        }
+// Returns all non-loopback IP addresses using `local_ip_address`.
+fn list_non_loopback_ips() -> Vec<IpAddr> {
+    match local_ip_address::list_afinet_netifas() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .map(|(_ifname, ip)| ip)
+            .filter(|ip| !ip.is_loopback())
+            .collect(),
+        Err(_) => Vec::new(),
     }
-    None
 }
